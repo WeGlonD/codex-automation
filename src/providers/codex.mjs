@@ -6,7 +6,7 @@ import { routeMessage } from './codex-router.mjs';
 
 // The only module allowed to know the Codex App Server wire protocol.
 export class CodexProvider extends EventEmitter {
-  id='codex';
+  id='codex';label='Codex';lastError='';
   capabilities=Object.freeze({resume:true,steer:true,approvals:true,models:true,usage:true,images:true,structuredOutput:true});
   constructor(rpc=new CodexRPC()) {
     super(); this.rpc=rpc;
@@ -16,7 +16,7 @@ export class CodexProvider extends EventEmitter {
     rpc.on('diagnostic',detail=>this.emit('diagnostic',detail));
   }
   get connected(){return this.rpc.connected;}
-  start(){return this.rpc.start();}
+  async start(){try{await this.rpc.start();this.lastError='';}catch(e){this.lastError=/ENOENT/.test(e.message)?'Codex CLI가 설치되어 있지 않습니다 (codex 명령을 찾을 수 없음).':e.message;throw e;}}
   stop(){return this.rpc.stop();}
   isRateLimitError(error){return isRateLimitError(error);}
   prepareInput(store,messages,directory,prefix=''){return {items:messageInput(store,messages,directory,prefix)};}

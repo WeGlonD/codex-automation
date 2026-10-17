@@ -29,7 +29,7 @@ switch ($Action) {
   'backup' { & $nodeExe scripts/backup.mjs; exit $LASTEXITCODE }
   'doctor' { & $nodeExe --version; & codex --version; & codex login status }
   'schema' { & codex app-server generate-json-schema --out (Join-Path $projectRoot 'protocol') }
-  'test' { & $nodeExe --check src/server.mjs; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $nodeExe --test test/engine.test.mjs test/recovery.test.mjs test/rate-limits.test.mjs test/provider-contract.test.mjs test/artifacts.test.mjs test/messages.test.mjs test/maintenance-requests.test.mjs; exit $LASTEXITCODE }
+  'test' { & $nodeExe --check src/server.mjs; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $nodeExe --test test/engine.test.mjs test/recovery.test.mjs test/rate-limits.test.mjs test/provider-contract.test.mjs test/artifacts.test.mjs test/messages.test.mjs test/maintenance-requests.test.mjs test/claude-provider.test.mjs; exit $LASTEXITCODE }
   'smoke' { & $nodeExe scripts/smoke.mjs; exit $LASTEXITCODE }
   'start' {
     $pidPath = Join-Path $dataPath 'server.pid'
