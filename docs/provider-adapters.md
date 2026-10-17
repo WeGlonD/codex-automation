@@ -4,7 +4,9 @@ The task engine accepts a provider object rather than a CLI or RPC client. `src/
 
 ## Current scope
 
-Codex is the only registered provider. Existing tasks are migrated to `provider_id='codex'`; their `thread_id` and `turn_id` values remain untouched. A task's provider cannot yet be changed in the UI. Per the [roadmap](../ROADMAP.md), Claude and Gemini adapters are left to contributors who use those services, and switching within one task is deferred until at least one such adapter is merged and verified. Adding an adapter does not automatically enable multi-provider scheduling or migration of a live conversation. Those need a registry and per-provider run history in a later change. Do not reinterpret another provider's saved session ID as your own.
+Codex and Claude are registered providers (`config.providers`, default `['codex','claude']`; `config.defaultProvider` picks the default). Each task keeps the provider stored in `provider_id`, and the engine routes runs, approvals and events by that ID; a disconnect only affects that provider's live tasks. Existing tasks are migrated to `provider_id='codex'`; their `thread_id` and `turn_id` values remain untouched. A task's provider is chosen when it is created and cannot be changed later. Switching within one task is still deferred. Do not reinterpret another provider's saved session ID as your own.
+
+`src/providers/claude.mjs` runs each turn through the Claude Agent SDK, which drives the locally installed Claude Code with the user's own Claude login; it strips `ANTHROPIC_API_KEY` so a run never falls back to API billing. Claude reports usage only alongside real turns, so the adapter keeps the last report in `data/claude-rate-limits.json`. It does not support `steer` (`capabilities.steer` is false).
 
 ## Required interface
 
@@ -41,6 +43,7 @@ All events carry provider-neutral `sessionId` and, when available, `turnId`. The
 | `approvalRequested` | `{requestId,sessionId,turnId,itemId,kind,questions,reason,details}`; `kind` is `execution`, `question`, or `unsupported` |
 | `approvalResolved` | `{requestId}` |
 | `disconnect`, `diagnostic`, `usageUpdated` | Connection reason, diagnostic text, or usage snapshot |
+| `sessionLost` | `{sessionId,turnId,reason}` when one session's backend dies mid-turn; that task enters recovery |
 
 The final assistant message must conform to the task result schema passed to `startTurn`: `status` (`completed`, `continue`, or `waiting`), `summary`, `decisionTitle`, `decisionBackground`, `question`, `options`, and `optionDetails`. For `waiting`, each option detail supplies its label, concrete action, pros, and cons so the decision inbox is self-contained; for other statuses the decision fields may be empty. An adapter without native structured output must enforce this in its prompt and validate the result before emitting it. A disconnected or uncertain turn must enter recovery; it must not be replayed automatically. A usage-limited turn can be retried only when the provider confirms capacity and the input's delivery state is known.
 

@@ -40,6 +40,7 @@ export class Store {
     }
     if(!columns.has('archived_at'))this.db.exec('ALTER TABLE tasks ADD COLUMN archived_at TEXT');
     if(!columns.has('provider_id'))this.db.exec("ALTER TABLE tasks ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'codex'");
+    if(!columns.has('archive_usage'))this.db.exec('ALTER TABLE tasks ADD COLUMN archive_usage TEXT');
   }
   now() { return new Date().toISOString(); }
   transaction(fn) { if(this.db.isTransaction)return fn();this.db.exec('BEGIN IMMEDIATE'); try { const value = fn(); this.db.exec('COMMIT'); return value; } catch (e) { this.db.exec('ROLLBACK'); throw e; } }
@@ -56,7 +57,7 @@ export class Store {
   list() { return this.db.prepare('SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC').all(); }
   latestMessages() { return this.db.prepare('SELECT task_id,id,created_at FROM messages WHERE id IN (SELECT MAX(id) FROM messages GROUP BY task_id)').all(); }
   patch(id, fields) {
-    const allowed = new Set(['status','thread_id','turn_id','summary','error','cycles','max_cycles','title','profile','model','effort','retry_at','session_model','session_effort','session_checked_at','settings_revision','applied_settings_revision','archived_at']);
+    const allowed = new Set(['status','thread_id','turn_id','summary','error','cycles','max_cycles','title','profile','model','effort','retry_at','session_model','session_effort','session_checked_at','settings_revision','applied_settings_revision','archived_at','archive_usage']);
     const entries = Object.entries(fields).filter(([k]) => allowed.has(k));
     if (!entries.length) return;
     this.db.prepare(`UPDATE tasks SET ${entries.map(([k]) => `${k}=?`).join(',')},updated_at=? WHERE id=?`).run(...entries.map(([,v]) => v), this.now(), id);
@@ -152,5 +153,32 @@ export class Store {
       this.db.prepare("UPDATE decisions SET status='expired',resolved_at=? WHERE status='pending' AND kind='approval'").run(this.now());
     });
   }
+  taskAttachmentIds(id) { return this.db.prepare('SELECT ma.attachment_id AS id FROM message_attachments ma JOIN messages m ON m.id=ma.message_id WHERE m.task_id=?').all(id).map(r=>r.id); }
+  // Bytes this task occupies inside the database.
+  taskRecordBytes(id) {
+    const one=(sql)=>Number(this.db.prepare(sql).get(id)?.n||0);
+    return {
+      attachments:one('SELECT SUM(a.size) AS n FROM attachments a JOIN message_attachments ma ON a.id=ma.attachment_id JOIN messages m ON m.id=ma.message_id WHERE m.task_id=?'),
+      records:one('SELECT SUM(LENGTH(CAST(text AS BLOB))) AS n FROM messages WHERE task_id=?')+one('SELECT SUM(LENGTH(CAST(question AS BLOB))+LENGTH(CAST(payload AS BLOB))) AS n FROM decisions WHERE task_id=?')+one('SELECT SUM(LENGTH(CAST(detail AS BLOB))) AS n FROM events WHERE task_id=?')
+    };
+  }
+  // Removes every row that belongs to one task. Files are the caller's job.
+  deleteTask(id) {
+    return this.transaction(()=>{
+      const attachments=this.taskAttachmentIds(id);
+      const decisions=this.db.prepare('SELECT id FROM decisions WHERE task_id=?').all(id).map(r=>r.id);
+      this.db.prepare('DELETE FROM message_attachments WHERE message_id IN (SELECT id FROM messages WHERE task_id=?)').run(id);
+      for(const aid of attachments)this.db.prepare('DELETE FROM attachments WHERE id=?').run(aid);
+      this.db.prepare('DELETE FROM messages WHERE task_id=?').run(id);
+      this.db.prepare('DELETE FROM decisions WHERE task_id=?').run(id);
+      this.db.prepare('DELETE FROM events WHERE task_id=?').run(id);
+      for(const did of decisions)this.db.prepare('DELETE FROM outbox WHERE text LIKE ?').run('%"decisionId":"'+did+'"%');
+      this.db.prepare("DELETE FROM inbox WHERE key LIKE ? OR result LIKE ?").run('message:'+id+':%','%"taskId":"'+id+'"%');
+      this.db.prepare('DELETE FROM tasks WHERE id=?').run(id);
+      return {attachments};
+    });
+  }
+  // Returns freed pages to the file system; deleted rows otherwise keep the file size.
+  compact() { this.db.exec('VACUUM'); }
   close() { this.db.close(); }
 }

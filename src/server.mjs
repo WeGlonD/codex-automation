@@ -6,15 +6,40 @@ import { randomBytes,randomInt,createHmac,timingSafeEqual } from 'node:crypto';
 import { Store } from './store.mjs';
 import { CodexRPC } from './providers/codex-rpc.mjs';
 import { CodexProvider } from './providers/codex.mjs';
+import { ClaudeProvider } from './providers/claude.mjs';
 import { Engine } from './engine.mjs';
 import { root,dataDir,config,accessToken,checkedWorkspace } from './config.mjs';
 import { receiveAttachment } from './attachments.mjs';
 import { listOutputFiles,resolveOutputFile } from './artifacts.mjs';
+import { pruneBackups,backupUsage } from './backups.mjs';
+import { pathSize } from './task-files.mjs';
+import { workspaceChoices,samePath,taskSpace } from './workspaces.mjs';
 
 const store=new Store(join(dataDir,'automation.sqlite'));
-const rpc=new CodexRPC(config.codexCommand);
-const provider=new CodexProvider(rpc);
-const engine=new Engine(store,provider,config,checkedWorkspace);
+const factories={
+  codex:()=>new CodexProvider(new CodexRPC(config.codexCommand)),
+  claude:()=>new ClaudeProvider({stateFile:join(dataDir,'claude-rate-limits.json')})
+};
+const providers=config.providers.filter(id=>factories[id]).map(id=>factories[id]());
+const engine=new Engine(store,providers,config,checkedWorkspace);
+// The provider named in a request, or the default one; tasks always use their own stored provider.
+function providerFor(id) {return engine.providerFor(id||engine.defaultProviderId);}
+// Disk use of agent-server's own data; archived tasks carry their size measured at archive time.
+function storageSummary() {
+  const size=path=>{try{return statSync(path).size;}catch{return 0;}};
+  const database=size(join(dataDir,'automation.sqlite'))+size(join(dataDir,'automation.sqlite-wal'));
+  const archived=store.list().filter(t=>t.archived_at);
+  const archivedBytes=archived.reduce((sum,t)=>{try{return sum+(JSON.parse(t.archive_usage||'null')?.total||0);}catch{return sum;}},0);
+  return {database,backups:backupUsage(join(dataDir,'backups')),attachmentCopies:pathSize(engine.attachmentRoot()),archived:{count:archived.length,bytes:archivedBytes},backupKeepDays:config.backupKeepDays,backupKeepMin:config.backupKeepMin};
+}
+// A folder picked in the composer must be one of the listed choices, never an automatic task folder.
+function chosenFolder(path) {
+  if(!path) return null;
+  const match=workspaceChoices(config.allowedRoots,config.workspaceRoot).flatMap(g=>g.folders).find(f=>samePath(f.path,path));
+  if(!match) throw new Error('고를 수 없는 작업 폴더입니다. 목록을 새로 불러오세요.');
+  return checkedWorkspace(match.path);
+}
+async function connectProviders() {await Promise.allSettled(providers.map(p=>p.start()));engine.changed();}
 const clients=new Set();const loginAttempts=new Map();const inFlight=new Map();
 let pairing=null;let closing=false;let webpush=null;
 try {webpush=(await import('web-push')).default;} catch {}
@@ -79,6 +104,7 @@ const maintenance=setInterval(async()=>{
     if(store.setting('lastBackup','')!==date) {
       const dir=join(dataDir,'backups');mkdirSync(dir,{recursive:true});
       await backup(store.db,join(dir,'automation-'+date+'.sqlite'));store.set('lastBackup',date);
+      for(const name of pruneBackups(dir,{keepDays:config.backupKeepDays,keepMin:config.backupKeepMin}))store.event(null,'backup_pruned',name);
     }
   } catch(e){store.event(null,'maintenance_error',e.message);}
 },30000);maintenance.unref();
@@ -88,7 +114,7 @@ const server=http.createServer(async(req,res)=>{
   if(!knownHost(req)) {json(res,403,{error:'Unknown host'});return;}
   const url=new URL(req.url,'http://localhost');
   try {
-    if(req.method==='GET'&&url.pathname==='/health') {json(res,200,{ok:true,version:'0.1.0',codexConnected:provider.connected,provider:provider.id});return;}
+    if(req.method==='GET'&&url.pathname==='/health') {json(res,200,{ok:true,version:'0.1.0',codexConnected:!!engine.providers.get('codex')?.connected,provider:engine.defaultProviderId,providers:providers.map(p=>({id:p.id,connected:!!p.connected}))});return;}
     const assets={'/':'index.html','/app.js':'app.js','/style.css':'style.css','/sw.js':'sw.js','/manifest.webmanifest':'manifest.webmanifest','/icon.svg':'icon.svg'};
     if(req.method==='GET'&&assets[url.pathname]) {
       const file=assets[url.pathname];const ext=file.split('.').pop();
@@ -118,7 +144,7 @@ const server=http.createServer(async(req,res)=>{
       const timer=setInterval(()=>res.write(': heartbeat\n\n'),20000);req.on('close',()=>{clearInterval(timer);clients.delete(res);});return;
     }
     if(req.method==='GET'&&url.pathname==='/api/state') {json(res,200,{...engine.snapshot(),publicOrigin:publicOrigin(),pushAvailable:!!webpush,vapidPublicKey:store.setting('vapid',{}).publicKey});return;}
-    if(req.method==='GET'&&url.pathname==='/api/limits') {const limits=await provider.usage();const models=await provider.models();json(res,200,{...limits,models,updatedAt:new Date().toISOString()});return;}
+    if(req.method==='GET'&&url.pathname==='/api/limits') {const provider=providerFor(url.searchParams.get('provider'));await provider.start();const limits=await provider.usage();const models=await provider.models();json(res,200,{...limits,provider:provider.id,account:provider.account?{subscriptionType:provider.account.subscriptionType||null}:null,models,updatedAt:new Date().toISOString()});return;}
     const artifactMatch=url.pathname.match(/^\/api\/tasks\/([a-f0-9]{8})\/files$/);
     if(req.method==='GET'&&artifactMatch){
       const task=engine.getTask(artifactMatch[1]);const base=checkedWorkspace(task.cwd);
@@ -131,14 +157,17 @@ const server=http.createServer(async(req,res)=>{
       }
       json(res,200,listOutputFiles(base));return;
     }
-    if(req.method==='GET'&&url.pathname==='/api/models') {json(res,200,{models:await engine.models()});return;}
+    if(req.method==='GET'&&url.pathname==='/api/workspaces') {json(res,200,{general:config.workspaceRoot,groups:workspaceChoices(config.allowedRoots,config.workspaceRoot)});return;}
+    if(req.method==='GET'&&url.pathname==='/api/storage') {json(res,200,storageSummary());return;}
+    if(req.method==='GET'&&url.pathname==='/api/models') {json(res,200,{models:await engine.models(providerFor(url.searchParams.get('provider')).id)});return;}
+    if(req.method==='POST'&&url.pathname==='/api/providers/reconnect') {for(const p of providers)if(!p.connected)p.failedAt=0;await connectProviders();json(res,200,{providers:engine.snapshot().providers});return;}
     if(req.method==='GET'&&url.pathname==='/api/maintenance-requests') {json(res,200,{requests:store.maintenanceRequests()});return;}
     const maintenanceMatch=url.pathname.match(/^\/api\/maintenance-requests\/([a-f0-9]{8})(?:\/notes)?$/);
     if(req.method==='GET'&&maintenanceMatch&&!url.pathname.endsWith('/notes')) {
       const request=store.maintenanceRequest(maintenanceMatch[1]);if(!request)throw new Error('개선 요청을 찾을 수 없습니다.');
       json(res,200,{request,notes:store.maintenanceNotes(request.id)});return;
     }
-    const taskMatch=url.pathname.match(/^\/api\/tasks\/([a-f0-9]{8})(?:\/(messages|pause|resume|steer|rename|settings|archive|restore))?$/);
+    const taskMatch=url.pathname.match(/^\/api\/tasks\/([a-f0-9]{8})(?:\/(messages|pause|resume|steer|rename|settings|archive|restore|usage|delete))?$/);
     if(taskMatch&&req.method==='GET'&&(!taskMatch[2]||taskMatch[2]==='messages')) {
       const task=engine.getTask(taskMatch[1]);
       const rawBefore=url.searchParams.get('before');
@@ -168,12 +197,18 @@ const server=http.createServer(async(req,res)=>{
       if(previous){json(res,200,JSON.parse(previous.result));return;}
       if(inFlight.has(key)){json(res,200,await inFlight.get(key));return;}
       store.validateAttachments(attachmentIds);
+      const selected=providerFor(input.provider);
+      // The current space narrows routing to its tasks; a new task starts in that space's folder.
+      // 'all' routes across every task and starts new work in the general folder.
+      const space=input.space&&input.space!=='all'?input.space:null;
+      const folder=space&&space!=='general'?chosenFolder(space):null;
       const work=(async()=>{
-        const route=input.target==='new'?{action:'new',title:text.slice(0,60),text}:input.target?{action:'existing',taskId:input.target,text}:await provider.classifyTask(store.list().filter(task=>!task.archived_at),text,attachmentIds.map(id=>store.attachment(id).name));
+        const candidates=store.list().filter(task=>!task.archived_at&&(!space||(folder?samePath(taskSpace(task.cwd,config),folder):taskSpace(task.cwd,config)===space)));
+        const route=input.target==='new'?{action:'new',title:text.slice(0,60),text}:input.target?{action:'existing',taskId:input.target,text}:await selected.classifyTask(candidates,text,attachmentIds.map(id=>store.attachment(id).name));
         if(route.action==='ask')return {needsChoice:true,reason:route.reason};
         return store.once(key,()=>{
           if(route.action==='existing'){engine.message(route.taskId,route.text,attachmentIds);return {taskId:route.taskId,action:'existing',reason:route.reason};}
-          const task=engine.create({goal:route.text,title:route.title,profile:input.profile,attachments:attachmentIds});return {taskId:task.id,action:'new',reason:route.reason};
+          const task=engine.create({goal:route.text,title:route.title,profile:input.profile,provider:selected.id,attachments:attachmentIds,...(folder?{cwd:folder}:{})});return {taskId:task.id,action:'new',reason:route.reason};
         });
       })();inFlight.set(key,work);
       try{json(res,200,await work);}finally{inFlight.delete(key);}return;
@@ -192,6 +227,8 @@ const server=http.createServer(async(req,res)=>{
       else if(action==='settings')await engine.configureTask(id,input);
       else if(action==='archive')await engine.archive(id);
       else if(action==='restore')engine.restore(id);
+      else if(action==='usage'){json(res,200,{usage:await engine.measureArchived(id)});return;}
+      else if(action==='delete'){if(input.confirm!==id)throw new Error('삭제 확인이 필요합니다.');json(res,200,await engine.deleteTask(id));return;}
       else throw new Error('알 수 없는 작업 동작');json(res,200,{ok:true});return;
     }
     const decisionMatch=url.pathname.match(/^\/api\/decisions\/([a-f0-9]{8})$/);
@@ -219,5 +256,5 @@ process.on('SIGINT',shutdown);process.on('SIGTERM',shutdown);
 server.on('error',e=>{console.error(e.message);process.exit(1);});
 server.listen(config.port,config.host,()=>{
   writeFileSync(join(dataDir,'open-dashboard.html'),'<!doctype html><meta charset="utf-8"><title>Codex Automation</title><script>location.replace('+JSON.stringify('http://127.0.0.1:'+config.port+'/#'+accessToken)+')</script>',{mode:0o600});
-  console.log('Codex Automation: http://127.0.0.1:'+config.port);engine.start();store.ensureDecisionNotices();scheduleDelivery();
+  console.log('Codex Automation: http://127.0.0.1:'+config.port);engine.start();store.ensureDecisionNotices();scheduleDelivery();void connectProviders();
 });
